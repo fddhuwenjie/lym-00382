@@ -1,14 +1,17 @@
 {
   "admin": {
     "password": "admin123",
-    "home": "admin"
+    "home": "admin",
+    "quota": 104857600
   },
   "user1": {
     "password": "user123",
-    "home": "user1"
+    "home": "user1",
+    "quota": 52428800
   },
   "user2": {
     "password": "user456",
-    "home": "user2"
+    "home": "user2",
+    "quota": 31457280
   }
 }

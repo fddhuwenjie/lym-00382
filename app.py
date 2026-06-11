@@ -8,7 +8,18 @@ from xml.etree import ElementTree as ET
 from fastapi import FastAPI, Request, Response, HTTPException, status
 from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse
 
-from config import get_user_home, LOCK_TIMEOUT
+from config import (
+    get_user_home,
+    LOCK_TIMEOUT,
+    get_user_quota,
+    get_user_usage,
+    get_available_quota,
+    check_quota,
+    set_file_owner,
+    get_file_owner,
+    remove_file_owner,
+    transfer_file_ownership,
+)
 from auth import authenticate
 from lock_manager import lock_manager
 from utils import (
@@ -35,7 +46,7 @@ def get_href_url(request: Request, path: str) -> str:
     return f"{request.url.scheme}://{request.url.netloc}/{urllib.parse.quote(path)}"
 
 
-def get_prop_element(prop_name: str, fs_path: Path, href_path: str):
+def get_prop_element(prop_name: str, fs_path: Path, href_path: str, username: str = ""):
     prop_name = prop_name.lower()
     try:
         if prop_name == "getcontentlength":
@@ -96,6 +107,20 @@ def get_prop_element(prop_name: str, fs_path: Path, href_path: str):
                 href_token = subel(token_el, "href")
                 href_token.text = lock.token
             return ld
+        elif prop_name == "quota-available-bytes":
+            if username:
+                available = get_available_quota(username)
+                return el("quota-available-bytes", str(available))
+            elem = el("quota-available-bytes")
+            elem.set("xmlns", DAV_NS)
+            return elem
+        elif prop_name == "quota-used-bytes":
+            if username:
+                used = get_user_usage(username)
+                return el("quota-used-bytes", str(used))
+            elem = el("quota-used-bytes")
+            elem.set("xmlns", DAV_NS)
+            return elem
         else:
             elem = el(prop_name)
             elem.set("xmlns", DAV_NS)
@@ -106,12 +131,12 @@ def get_prop_element(prop_name: str, fs_path: Path, href_path: str):
         return elem
 
 
-def build_propstat_response(request: Request, fs_path: Path, href_path: str, requested_props: List[str]) -> ET.Element:
+def build_propstat_response(request: Request, fs_path: Path, href_path: str, requested_props: List[str], username: str = "") -> ET.Element:
     propstat = el("propstat")
     prop = el("prop")
     
     for prop_name in requested_props:
-        elem = get_prop_element(prop_name, fs_path, href_path)
+        elem = get_prop_element(prop_name, fs_path, href_path, username)
         prop.append(elem)
     
     propstat.append(prop)
@@ -121,7 +146,7 @@ def build_propstat_response(request: Request, fs_path: Path, href_path: str, req
     return propstat
 
 
-def build_multistatus_response(request: Request, resources: List[tuple], requested_props: List[str]) -> bytes:
+def build_multistatus_response(request: Request, resources: List[tuple], requested_props: List[str], username: str = "") -> bytes:
     multistatus = el("multistatus")
     
     for fs_path, href_path in resources:
@@ -141,7 +166,7 @@ def build_multistatus_response(request: Request, resources: List[tuple], request
             status.text = "HTTP/1.1 404 Not Found"
             response.append(propstat)
         else:
-            propstat = build_propstat_response(request, fs_path, href_path, requested_props)
+            propstat = build_propstat_response(request, fs_path, href_path, requested_props, username)
             response.append(propstat)
         
         multistatus.append(response)
@@ -394,20 +419,39 @@ async def handle_put(request: Request, path: str = ""):
     check_lock(request, str(fs_path), "PUT")
     
     file_existed = fs_path.exists()
+    old_size = 0
+    old_owner = None
     
     if file_existed:
         etag_response = check_etag(request, fs_path)
         if etag_response is not None:
             return etag_response
+        old_size = fs_path.stat().st_size
+        old_owner = get_file_owner(fs_path)
     
     if fs_path.is_dir():
         raise HTTPException(status_code=409, detail="Conflict: Cannot PUT to a directory")
     
+    body = await get_request_body(request)
+    new_size = len(body)
+    
+    if old_owner == username:
+        additional_bytes = new_size - old_size
+        if additional_bytes > 0 and not check_quota(username, additional_bytes):
+            raise HTTPException(status_code=507, detail="Insufficient Storage")
+    elif old_owner is not None and old_owner != username:
+        if not check_quota(username, new_size):
+            raise HTTPException(status_code=507, detail="Insufficient Storage")
+    else:
+        if not check_quota(username, new_size):
+            raise HTTPException(status_code=507, detail="Insufficient Storage")
+    
     fs_path.parent.mkdir(parents=True, exist_ok=True)
     
-    body = await get_request_body(request)
     with open(fs_path, "wb") as f:
         f.write(body)
+    
+    set_file_owner(fs_path, username)
     
     new_etag = get_etag(fs_path)
     
@@ -418,6 +462,50 @@ async def handle_put(request: Request, path: str = ""):
             "Last-Modified": format_http_date(fs_path.stat().st_mtime),
         },
     )
+
+
+def _collect_all_paths(path: Path) -> List[Path]:
+    paths = [path]
+    if path.is_dir():
+        try:
+            for entry in path.iterdir():
+                paths.extend(_collect_all_paths(entry))
+        except OSError:
+            pass
+    return paths
+
+
+def _calculate_total_size(path: Path) -> int:
+    total = 0
+    if path.is_file():
+        try:
+            total = path.stat().st_size
+        except OSError:
+            pass
+    elif path.is_dir():
+        try:
+            for entry in path.iterdir():
+                total += _calculate_total_size(entry)
+        except OSError:
+            pass
+    return total
+
+
+def _collect_file_paths_with_size(path: Path) -> List[tuple]:
+    results = []
+    if path.is_file():
+        try:
+            results.append((path, path.stat().st_size))
+        except OSError:
+            pass
+    elif path.is_dir():
+        results.append((path, 0))
+        try:
+            for entry in path.iterdir():
+                results.extend(_collect_file_paths_with_size(entry))
+        except OSError:
+            pass
+    return results
 
 
 @app.api_route("/{path:path}", methods=["DELETE"])
@@ -435,10 +523,15 @@ async def handle_delete(request: Request, path: str = ""):
     
     check_lock(request, str(fs_path), "DELETE")
     
+    all_paths = _collect_all_paths(fs_path)
+    
     if fs_path.is_dir():
         shutil.rmtree(fs_path)
     else:
         fs_path.unlink()
+    
+    for p in all_paths:
+        remove_file_owner(p)
     
     return Response(status_code=204)
 
@@ -463,6 +556,7 @@ async def handle_mkcol(request: Request, path: str = ""):
     check_lock(request, str(fs_path), "MKCOL")
     
     fs_path.mkdir(parents=False)
+    set_file_owner(fs_path, username)
     
     return Response(status_code=201)
 
@@ -490,7 +584,7 @@ async def handle_propfind(request: Request, path: str = ""):
     href_path = path
     resources = collect_resources(user_home, fs_path, href_path, depth)
     
-    xml_content = build_multistatus_response(request, resources, requested_props)
+    xml_content = build_multistatus_response(request, resources, requested_props, username)
     
     return Response(
         content=xml_content,
@@ -583,8 +677,35 @@ async def handle_copy(request: Request, path: str = ""):
     if dest_existed and not overwrite:
         raise HTTPException(status_code=412, detail="Precondition Failed")
     
+    src_files = _collect_file_paths_with_size(src_path)
+    
+    if depth != "infinity" and src_path.is_dir():
+        src_files = [(src_path, 0)]
+    
+    total_src_size = sum(size for _, size in src_files)
+    
+    old_dest_size = 0
+    old_dest_owned_size = 0
+    old_dest_files = []
+    if dest_existed:
+        old_dest_files = _collect_file_paths_with_size(dest_path)
+        old_dest_size = sum(size for _, size in old_dest_files)
+        for p, size in old_dest_files:
+            if get_file_owner(p) == username:
+                old_dest_owned_size += size
+    
+    if old_dest_owned_size > 0:
+        additional_bytes = total_src_size - old_dest_owned_size
+    else:
+        additional_bytes = total_src_size
+    
+    if additional_bytes > 0 and not check_quota(username, additional_bytes):
+        raise HTTPException(status_code=507, detail="Insufficient Storage")
+    
     if src_path.is_dir():
         if dest_existed:
+            for p, _ in old_dest_files:
+                remove_file_owner(p)
             if dest_path.is_file():
                 dest_path.unlink()
             else:
@@ -597,11 +718,23 @@ async def handle_copy(request: Request, path: str = ""):
     else:
         dest_path.parent.mkdir(parents=True, exist_ok=True)
         if dest_existed:
+            for p, _ in old_dest_files:
+                remove_file_owner(p)
             if dest_path.is_dir():
                 shutil.rmtree(dest_path)
             else:
                 dest_path.unlink()
         shutil.copy2(src_path, dest_path)
+    
+    if src_path.is_dir() and depth == "infinity":
+        for src_file, _ in src_files:
+            rel = src_file.relative_to(src_path)
+            dest_file = dest_path / rel
+            set_file_owner(dest_file, username)
+    elif src_path.is_dir():
+        set_file_owner(dest_path, username)
+    else:
+        set_file_owner(dest_path, username)
     
     return Response(status_code=204 if dest_existed else 201)
 
@@ -629,13 +762,49 @@ async def handle_move(request: Request, path: str = ""):
     if dest_existed and not overwrite:
         raise HTTPException(status_code=412, detail="Precondition Failed")
     
+    src_files = _collect_file_paths_with_size(src_path)
+    total_src_size = sum(size for _, size in src_files)
+    src_owner = get_file_owner(src_path)
+    
+    old_dest_size = 0
+    old_dest_owned_size = 0
+    old_dest_files = []
     if dest_existed:
+        old_dest_files = _collect_file_paths_with_size(dest_path)
+        old_dest_size = sum(size for _, size in old_dest_files)
+        for p, size in old_dest_files:
+            if get_file_owner(p) == username:
+                old_dest_owned_size += size
+    
+    if src_owner == username:
+        if old_dest_owned_size > 0:
+            additional_bytes = total_src_size - old_dest_owned_size
+        else:
+            additional_bytes = 0
+    else:
+        if old_dest_owned_size > 0:
+            additional_bytes = total_src_size - old_dest_owned_size
+        else:
+            additional_bytes = total_src_size
+    
+    if additional_bytes > 0 and not check_quota(username, additional_bytes):
+        raise HTTPException(status_code=507, detail="Insufficient Storage")
+    
+    if dest_existed:
+        for p, _ in old_dest_files:
+            remove_file_owner(p)
         if dest_path.is_dir():
             shutil.rmtree(dest_path)
         else:
             dest_path.unlink()
     
     dest_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    for src_file, _ in src_files:
+        rel = src_file.relative_to(src_path)
+        dest_file = dest_path / rel
+        transfer_file_ownership(src_file, dest_file, username)
+    
     shutil.move(str(src_path), str(dest_path))
     
     return Response(status_code=204 if dest_existed else 201)

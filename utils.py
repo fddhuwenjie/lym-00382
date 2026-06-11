@@ -171,22 +171,22 @@ def parse_lock_request(body: bytes) -> dict:
 
 def parse_propfind_request(body: bytes) -> list:
     if not body:
-        return ["getcontentlength", "getcontenttype", "getlastmodified", "resourcetype"]
+        return ["getcontentlength", "getcontenttype", "getlastmodified", "resourcetype", "quota-available-bytes", "quota-used-bytes"]
     try:
         root = ET.fromstring(body)
         prop = root.find(f"{{{DAV_NS}}}prop")
         if prop is None:
             allprop = root.find(f"{{{DAV_NS}}}allprop")
             if allprop is not None:
-                return ["getcontentlength", "getcontenttype", "getlastmodified", "resourcetype", "getetag"]
-            return ["getcontentlength", "getcontenttype", "getlastmodified", "resourcetype"]
+                return ["getcontentlength", "getcontenttype", "getlastmodified", "resourcetype", "getetag", "quota-available-bytes", "quota-used-bytes"]
+            return ["getcontentlength", "getcontenttype", "getlastmodified", "resourcetype", "quota-available-bytes", "quota-used-bytes"]
         props = []
         for child in prop:
             tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
             props.append(tag.lower())
         return props
     except ET.ParseError:
-        return ["getcontentlength", "getcontenttype", "getlastmodified", "resourcetype"]
+        return ["getcontentlength", "getcontenttype", "getlastmodified", "resourcetype", "quota-available-bytes", "quota-used-bytes"]
 
 
 def parse_proppatch_request(body: bytes) -> list:
