@@ -28,6 +28,6 @@ def get_user_home(username: str) -> Path:
     users = load_users()
     if username not in users:
         raise ValueError(f"User {username} not found")
-    home_dir = STORAGE_DIR / users[username]["home"]
-    home_dir.mkdir(parents=True, exist_ok=True)
-    return home_dir
+    shared_dir = STORAGE_DIR / "shared"
+    shared_dir.mkdir(parents=True, exist_ok=True)
+    return shared_dir

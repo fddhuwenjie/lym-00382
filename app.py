@@ -236,9 +236,10 @@ def check_lock(request: Request, fs_path: str, method: str) -> None:
         )
 
 
-def check_etag(request: Request, fs_path: Path) -> None:
+def check_etag(request: Request, fs_path: Path) -> Optional[Response]:
     if_match = request.headers.get("If-Match")
     if_none_match = request.headers.get("If-None-Match")
+    method = request.method
     
     if if_match and if_match != "*":
         current_etag = get_etag(fs_path)
@@ -250,7 +251,12 @@ def check_etag(request: Request, fs_path: Path) -> None:
         current_etag = get_etag(fs_path)
         matches = [m.strip() for m in if_none_match.split(",")]
         if current_etag in matches or "*" in matches:
-            raise HTTPException(status_code=412, detail="Precondition Failed")
+            if method in ["GET", "HEAD"]:
+                return Response(status_code=304)
+            else:
+                raise HTTPException(status_code=412, detail="Precondition Failed")
+    
+    return None
 
 
 async def get_request_body(request: Request) -> bytes:
@@ -309,7 +315,9 @@ async def handle_get(request: Request, path: str = ""):
     if not fs_path.exists():
         raise HTTPException(status_code=404, detail="Not Found")
     
-    check_etag(request, fs_path)
+    etag_response = check_etag(request, fs_path)
+    if etag_response is not None:
+        return etag_response
     
     if fs_path.is_dir():
         html = generate_directory_html(user_home, fs_path, request, path)
@@ -384,7 +392,13 @@ async def handle_put(request: Request, path: str = ""):
         raise HTTPException(status_code=403, detail="Forbidden")
     
     check_lock(request, str(fs_path), "PUT")
-    check_etag(request, fs_path)
+    
+    file_existed = fs_path.exists()
+    
+    if file_existed:
+        etag_response = check_etag(request, fs_path)
+        if etag_response is not None:
+            return etag_response
     
     if fs_path.is_dir():
         raise HTTPException(status_code=409, detail="Conflict: Cannot PUT to a directory")
@@ -398,7 +412,7 @@ async def handle_put(request: Request, path: str = ""):
     new_etag = get_etag(fs_path)
     
     return Response(
-        status_code=201 if not fs_path.exists() or len(body) > 0 else 204,
+        status_code=201 if not file_existed else 204,
         headers={
             "ETag": new_etag,
             "Last-Modified": format_http_date(fs_path.stat().st_mtime),
@@ -564,11 +578,13 @@ async def handle_copy(request: Request, path: str = ""):
     depth = request.headers.get("Depth", "infinity")
     overwrite = request.headers.get("Overwrite", "T").upper() == "T"
     
-    if dest_path.exists() and not overwrite:
+    dest_existed = dest_path.exists()
+    
+    if dest_existed and not overwrite:
         raise HTTPException(status_code=412, detail="Precondition Failed")
     
     if src_path.is_dir():
-        if dest_path.exists():
+        if dest_existed:
             if dest_path.is_file():
                 dest_path.unlink()
             else:
@@ -580,14 +596,14 @@ async def handle_copy(request: Request, path: str = ""):
             dest_path.mkdir(parents=True)
     else:
         dest_path.parent.mkdir(parents=True, exist_ok=True)
-        if dest_path.exists():
+        if dest_existed:
             if dest_path.is_dir():
                 shutil.rmtree(dest_path)
             else:
                 dest_path.unlink()
         shutil.copy2(src_path, dest_path)
     
-    return Response(status_code=204 if dest_path.exists() and overwrite else 201)
+    return Response(status_code=204 if dest_existed else 201)
 
 
 @app.api_route("/{path:path}", methods=["MOVE"])
@@ -608,10 +624,12 @@ async def handle_move(request: Request, path: str = ""):
     dest_path, dest_href = get_destination_path(request, user_home)
     overwrite = request.headers.get("Overwrite", "T").upper() == "T"
     
-    if dest_path.exists() and not overwrite:
+    dest_existed = dest_path.exists()
+    
+    if dest_existed and not overwrite:
         raise HTTPException(status_code=412, detail="Precondition Failed")
     
-    if dest_path.exists():
+    if dest_existed:
         if dest_path.is_dir():
             shutil.rmtree(dest_path)
         else:
@@ -620,7 +638,7 @@ async def handle_move(request: Request, path: str = ""):
     dest_path.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(src_path), str(dest_path))
     
-    return Response(status_code=204 if dest_path.exists() and overwrite else 201)
+    return Response(status_code=204 if dest_existed else 201)
 
 
 @app.api_route("/{path:path}", methods=["LOCK"])

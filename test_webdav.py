@@ -224,8 +224,16 @@ def test_8_if_match():
         **HEADERS,
         "If-None-Match": etag,
     })
-    print(f"If-None-Match Status: {r.status_code}")
-    assert r.status_code == 412
+    print(f"GET If-None-Match Status: {r.status_code}")
+    assert r.status_code == 304, f"Expected 304 for GET, got {r.status_code}"
+    
+    r = httpx.put(f"{BASE_URL}/etag_test2.txt", headers=HEADERS, content=b"new")
+    r = httpx.put(f"{BASE_URL}/etag_test2.txt", headers={
+        **HEADERS,
+        "If-None-Match": "*",
+    }, content=b"should fail")
+    print(f"PUT If-None-Match: * Status: {r.status_code}")
+    assert r.status_code == 412, f"Expected 412 for PUT, got {r.status_code}"
     
     r = httpx.put(f"{BASE_URL}/etag_test.txt", headers={
         **HEADERS,
@@ -321,6 +329,137 @@ def test_11_copy_large_directory():
     print("PASS\n")
 
 
+def test_12_cross_user_lock():
+    print("=== Test 12: Cross-User Lock Protection ===")
+    
+    admin_auth = base64.b64encode(f"admin:{PASSWORD}".encode()).decode()
+    admin_headers = {"Authorization": f"Basic {admin_auth}"}
+    
+    user1_auth = base64.b64encode(f"user1:user123".encode()).decode()
+    user1_headers = {"Authorization": f"Basic {user1_auth}"}
+    
+    httpx.put(f"{BASE_URL}/shared_test.txt", headers=admin_headers, content=b"admin content")
+    
+    lock_body = b"""<?xml version="1.0" encoding="utf-8"?>
+<D:lockinfo xmlns:D="DAV:">
+  <D:lockscope><D:exclusive/></D:lockscope>
+  <D:locktype><D:write/></D:locktype>
+  <D:owner><D:href>mailto:admin@example.com</D:href></D:owner>
+</D:lockinfo>"""
+    
+    r = httpx.request("LOCK", f"{BASE_URL}/shared_test.txt", headers={
+        **admin_headers,
+        "Content-Type": "application/xml",
+    }, content=lock_body)
+    
+    print(f"admin LOCK Status: {r.status_code}")
+    assert r.status_code == 200
+    lock_token = r.headers.get("Lock-Token")
+    print(f"Lock-Token: {lock_token}")
+    
+    r = httpx.put(f"{BASE_URL}/shared_test.txt", headers=user1_headers, content=b"user1 modified")
+    print(f"user1 PUT without lock Status: {r.status_code}")
+    assert r.status_code == 423, f"Expected 423 Locked, got {r.status_code}"
+    
+    httpx.request("UNLOCK", f"{BASE_URL}/shared_test.txt", headers={
+        **admin_headers,
+        "Lock-Token": lock_token,
+    })
+    
+    r = httpx.put(f"{BASE_URL}/shared_test.txt", headers=user1_headers, content=b"user1 modified after unlock")
+    print(f"user1 PUT after unlock Status: {r.status_code}")
+    assert r.status_code in [200, 201, 204]
+    
+    print("PASS\n")
+
+
+def test_13_304_not_modified():
+    print("=== Test 13: 304 Not Modified for GET If-None-Match ===")
+    
+    content = b"304 test content"
+    r = httpx.put(f"{BASE_URL}/304_test.txt", headers=HEADERS, content=content)
+    etag = r.headers.get("ETag")
+    print(f"ETag: {etag}")
+    
+    r = httpx.get(f"{BASE_URL}/304_test.txt", headers={
+        **HEADERS,
+        "If-None-Match": etag,
+    })
+    print(f"GET with If-None-Match Status: {r.status_code}")
+    assert r.status_code == 304, f"Expected 304 Not Modified, got {r.status_code}"
+    assert len(r.content) == 0
+    
+    r = httpx.get(f"{BASE_URL}/304_test.txt", headers={
+        **HEADERS,
+        "If-None-Match": '"wrong-etag"',
+    })
+    print(f"GET with wrong If-None-Match Status: {r.status_code}")
+    assert r.status_code == 200
+    assert r.content == content
+    
+    r = httpx.put(f"{BASE_URL}/304_test.txt", headers={
+        **HEADERS,
+        "If-None-Match": "*",
+    }, content=b"new content")
+    print(f"PUT with If-None-Match: * Status: {r.status_code}")
+    assert r.status_code == 412, f"Expected 412 for PUT, got {r.status_code}"
+    
+    print("PASS\n")
+
+
+def test_14_copy_move_status_codes():
+    print("=== Test 14: COPY/MOVE Status Codes ===")
+    import time
+    unique = str(int(time.time()))
+    
+    httpx.put(f"{BASE_URL}/cm_src_{unique}.txt", headers=HEADERS, content=b"source")
+    
+    r = httpx.request("COPY", f"{BASE_URL}/cm_src_{unique}.txt", headers={
+        **HEADERS,
+        "Destination": f"{BASE_URL}/cm_new_{unique}.txt",
+    })
+    print(f"COPY to new Status: {r.status_code}")
+    assert r.status_code == 201, f"Expected 201 Created, got {r.status_code}"
+    
+    r = httpx.request("COPY", f"{BASE_URL}/cm_src_{unique}.txt", headers={
+        **HEADERS,
+        "Destination": f"{BASE_URL}/cm_new_{unique}.txt",
+        "Overwrite": "T",
+    })
+    print(f"COPY overwrite Status: {r.status_code}")
+    assert r.status_code == 204, f"Expected 204 No Content, got {r.status_code}"
+    
+    httpx.put(f"{BASE_URL}/cm_move_src_{unique}.txt", headers=HEADERS, content=b"move source")
+    
+    r = httpx.request("MOVE", f"{BASE_URL}/cm_move_src_{unique}.txt", headers={
+        **HEADERS,
+        "Destination": f"{BASE_URL}/cm_move_new_{unique}.txt",
+    })
+    print(f"MOVE to new Status: {r.status_code}")
+    assert r.status_code == 201, f"Expected 201 Created, got {r.status_code}"
+    
+    httpx.put(f"{BASE_URL}/cm_move_src2_{unique}.txt", headers=HEADERS, content=b"move source 2")
+    httpx.put(f"{BASE_URL}/cm_move_exist_{unique}.txt", headers=HEADERS, content=b"existing")
+    
+    r = httpx.request("MOVE", f"{BASE_URL}/cm_move_src2_{unique}.txt", headers={
+        **HEADERS,
+        "Destination": f"{BASE_URL}/cm_move_exist_{unique}.txt",
+        "Overwrite": "T",
+    })
+    print(f"MOVE overwrite Status: {r.status_code}")
+    assert r.status_code == 204, f"Expected 204 No Content, got {r.status_code}"
+    
+    r = httpx.put(f"{BASE_URL}/put_new_{unique}.txt", headers=HEADERS, content=b"new file")
+    print(f"PUT new Status: {r.status_code}")
+    assert r.status_code == 201, f"Expected 201 Created, got {r.status_code}"
+    
+    r = httpx.put(f"{BASE_URL}/put_new_{unique}.txt", headers=HEADERS, content=b"overwrite")
+    print(f"PUT overwrite Status: {r.status_code}")
+    assert r.status_code == 204, f"Expected 204 No Content, got {r.status_code}"
+    
+    print("PASS\n")
+
+
 def main():
     print("Starting WebDAV tests...\n")
     
@@ -343,6 +482,9 @@ def main():
         test_9_path_traversal,
         test_10_unicode_filename,
         test_11_copy_large_directory,
+        test_12_cross_user_lock,
+        test_13_304_not_modified,
+        test_14_copy_move_status_codes,
     ]
     
     passed = 0
